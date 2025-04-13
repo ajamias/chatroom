@@ -36,8 +36,8 @@ void *handle_server(void *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc != 3) {
-		printf("Usage: client <server_port> <remote_ip_address>\n");
+	if (argc != 4) {
+		printf("Usage: client <server_ipv4> <server_port> <remote_ipv4>\n");
 		_exit(-1);
 	}
 
@@ -49,32 +49,26 @@ int main(int argc, char **argv)
 
 	struct sockaddr_in server_addr = {
 		.sin_family = AF_INET,
-		.sin_port = htons(atoi(argv[1]))
+		.sin_addr.s_addr = inet_addr(argv[1]),
+		.sin_port = htons(atoi(argv[2]))
 	};
-	if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) != 1) {
-		perror("inet_pton");
-		_exit(errno);
-	}
 
 	if (connect(server_socket, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
 		perror("connect");
 		_exit(errno);
 	}
 	
-	struct in_addr remote_addr;
-	if (inet_pton(AF_INET, argv[2], &remote_addr) != 1) {
-		perror("inet_pton");
-		_exit(errno);
-	}
-	
-	if (send(server_socket, &remote_addr.s_addr, sizeof(remote_addr.s_addr), 0) != sizeof(remote_addr.s_addr)) {
-		perror("send");
-		_exit(errno);
-	}
-
 	pthread_t handle_server_tid;
 	if (pthread_create(&handle_server_tid, NULL, handle_server, (void *) server_socket) != 0) {
 		perror("pthread_create");
+		_exit(errno);
+	}
+
+	struct in_addr remote_addr = {
+		.s_addr = inet_addr(argv[3])
+	};
+	if (send(server_socket, &remote_addr.s_addr, sizeof(remote_addr.s_addr), 0) != sizeof(remote_addr.s_addr)) {
+		perror("send");
 		_exit(errno);
 	}
 
