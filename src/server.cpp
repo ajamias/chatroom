@@ -31,6 +31,8 @@ std::map< uint32_t, struct serve_info * > remote_to_remote_info;	// mapping will
 void *handle_clients(void *arg);
 void *handle_client(void *info);
 void *attempt_remote_connect(void *info);
+void *handle_remotes(void *arg);
+void *handle_remote(void *info);
 
 char *server_bind_address;
 char *client_port;
@@ -60,14 +62,13 @@ int main(int argc, char **argv)
 	}
 	pthread_detach(clients_handler_tid);
 
-/*
 	pthread_t remotes_handler_tid;
 	if ((ret = pthread_create(&remotes_handler_tid, NULL, handle_remotes, NULL)) != 0) {
 		perror("pthread_create");
 		_exit(ret);
 	}
 	pthread_detach(remotes_handler_tid);
-*/
+
 	// block main forever
 	pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 	pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -260,7 +261,21 @@ void *attempt_remote_connect(void *info)
 
 	uint64_t remote_socket = socket(AF_INET, SOCK_STREAM, 0);
 	if (remote_socket == -1ull) {
+		perror("socket");
 		pthread_cond_signal(&attempt_info->cond);
+		pthread_exit(NULL);
+	}
+
+	struct sockaddr_in local_addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = inet_addr(server_bind_address),
+		.sin_port = 0
+	};
+
+	if (bind(remote_socket, (struct sockaddr *) &local_addr, sizeof(local_addr)) == -1) {
+		perror("bind");
+		pthread_cond_signal(&attempt_info->cond);
+		close(remote_socket);
 		pthread_exit(NULL);
 	}
 
@@ -271,6 +286,14 @@ void *attempt_remote_connect(void *info)
 	};
 
 	if (connect(remote_socket, (struct sockaddr *) &remote_addr, sizeof(remote_addr)) == -1) {
+		perror("connect");
+		pthread_cond_signal(&attempt_info->cond);
+		close(remote_socket);
+		pthread_exit(NULL);
+	}
+
+	uint8_t confirmation = 0;
+	if (recv(remote_socket, &confirmation, sizeof(confirmation), 0) != sizeof(confirmation) || confirmation != 42) {
 		pthread_cond_signal(&attempt_info->cond);
 		close(remote_socket);
 		pthread_exit(NULL);
@@ -286,6 +309,143 @@ void *attempt_remote_connect(void *info)
 
 	pthread_cond_signal(&attempt_info->cond);
 
+	while (1) {
+		uint32_t network_message_size;
+		switch (recv(remote_socket, &network_message_size, sizeof(network_message_size), 0)) {
+		case 0:
+			printf("server: remote disconnected\n");
+			close(remote_socket);
+			remote_info->socket_fd = -1;
+			remote_info->thread_id = (pthread_t) -1;
+			pthread_exit(NULL);
+			break;
+		case -1:
+			perror("recv");
+			continue;
+		}
+
+		pthread_mutex_lock(remote_info->lock);
+		printf("server: locking in\n");
+
+		uint32_t message_size = ntohl(network_message_size);
+		printf("server: recv message length: %d\n", message_size);
+
+		char *message = (char *) malloc(message_size + 1);
+		message[message_size] = '\0';
+
+		switch (recv(remote_info->socket_fd, message, message_size, 0)) {
+		case 0:
+			printf("server: remote disconnected\n");
+			close(remote_info->socket_fd);
+			remote_info->socket_fd = -1;
+			remote_info->thread_id = (pthread_t) -1;
+			free(message);
+			pthread_mutex_unlock(remote_info->lock);
+			pthread_exit(NULL);
+			break;
+		case -1:
+			perror("recv");
+			continue;
+		}
+		printf("server: recv from remote: %s", message);
+
+		for (uint32_t client_fd : remote_to_client_fd[remote_info->addr.sin_addr.s_addr]) {
+			send(client_fd, &network_message_size, sizeof(network_message_size), 0);
+			send(client_fd, message, message_size, 0);
+		}
+		printf("server: sent to connected clients\n");
+
+		free(message);
+
+		pthread_mutex_unlock(remote_info->lock);
+		printf("server: unlocking in\n");
+	}
+
+	return NULL;
+}
+
+
+void *handle_remotes(void *arg)
+{
+	(void) arg;
+
+	int serve_remote_socket = socket(AF_INET, SOCK_STREAM, 0);
+	if (serve_remote_socket == -1) {
+		perror("socket");
+		_exit(errno);
+	}
+	int opt = 1;
+	if (setsockopt(serve_remote_socket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
+		perror("setsockopt");
+		close(serve_remote_socket);
+		_exit(errno);
+	}
+
+	struct sockaddr_in server_addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = inet_addr(server_bind_address),
+		.sin_port = htons(atoi(remote_port))
+	};
+
+	if (bind(serve_remote_socket, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
+		perror("bind");
+		close(serve_remote_socket);
+		_exit(errno);
+	}
+
+	if (listen(serve_remote_socket, 8) == -1) {
+		perror("listen");
+		_exit(errno);
+	}
+	printf("server: listening for remote connections\n");
+
+	while (1) {
+		struct sockaddr_in remote_addr;
+		socklen_t remote_addr_len = sizeof(remote_addr);
+
+		uint64_t remote_socket = accept(serve_remote_socket, (struct sockaddr *) &remote_addr, &remote_addr_len);
+		if (remote_socket == -1ull) {
+			perror("accept");
+			continue;
+		}
+
+		// TODO: print out IPs and error check
+		if (remote_to_remote_info.find(remote_addr.sin_addr.s_addr) != remote_to_remote_info.end()) {
+			printf("server: accepted remote connection from %s\n", inet_ntoa(remote_addr.sin_addr));
+
+			uint8_t confirmation = 42;
+			if (send(remote_socket, &confirmation, sizeof(confirmation), 0) != sizeof(confirmation)) {
+				close(remote_socket);
+				continue;
+			}
+
+			struct serve_info *remote_info = remote_to_remote_info[remote_addr.sin_addr.s_addr];
+			remote_info->socket_fd = remote_socket;
+			remote_info->addr = remote_addr;
+			remote_info->addr_len = remote_addr_len;
+
+			pthread_t remote_thread_id;
+			if (pthread_create(&remote_thread_id, NULL, handle_remote, (void *) remote_info) != 0) {
+				perror("pthread_create");
+				close(remote_socket);
+			}
+		} else {
+			// reject connection
+			printf("server: A remote connection not matching a client was attemptedi from %s\n", inet_ntoa(remote_addr.sin_addr));
+			close(remote_socket);
+		}
+	}
+
+	return NULL;
+}
+
+
+void *handle_remote(void *info)
+{
+	struct serve_info *remote_info = (struct serve_info *) info;
+	remote_info->thread_id = pthread_self();
+	int remote_socket = remote_info->socket_fd;
+	
 	while (1) {
 		uint32_t network_message_size;
 		switch (recv(remote_socket, &network_message_size, sizeof(network_message_size), 0)) {
