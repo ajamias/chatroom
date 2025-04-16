@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/errno.h>
+#include <libpq-fe.h>
 
 
 struct serve_info {
@@ -31,8 +32,13 @@ std::map< uint32_t, struct serve_info * > remote_to_remote_info;	// mapping will
 void *handle_clients(void *arg);
 void *handle_client(void *info);
 void *attempt_remote_connect(void *info);
+int store_message(char *message, char safe_ip_str[INET_ADDRSTRLEN], bool is_sent);
+void update_sent_message(int message_id, char safe_ip_str[INET_ADDRSTRLEN]);
+void handle_client_disconnect(uint64_t client_socket, uint32_t s_addr);
 void *handle_remotes(void *arg);
 void *handle_remote(void *info);
+
+const uint8_t CONFIRMATION = 42;
 
 char *server_bind_address;
 char *client_port;
@@ -40,18 +46,32 @@ char *remote_port;
 
 pthread_mutex_t client_creation_lock;
 
+PGconn *conn = NULL;
+
 int main(int argc, char **argv)
 {
 	int ret;
 
-	if (argc != 4) {
-		printf("Usage: server <binding_ip> <client_port> <remote_port>\n");
+	if (argc != 5) {
+		printf("Usage: server <binding_ip> <client_port> <remote_port> <psql_password>\n");
 		_exit(EXIT_FAILURE);
 	}
 
 	server_bind_address = argv[1];
 	client_port = argv[2];
 	remote_port = argv[3];
+
+	const char *conn_template = "host=localhost port=5432 dbname=chatroom_%s user=postgres password=%s";
+	int query_length = snprintf(NULL, 0, conn_template, server_bind_address, argv[4]) + 1;
+	char *conninfo = (char *) calloc(query_length, sizeof(char));
+	snprintf(conninfo, query_length, conn_template, server_bind_address, argv[4]);
+	conn = PQconnectdb(conninfo);
+	free(conninfo);
+	if (PQstatus(conn) != CONNECTION_OK) {
+		fprintf(stderr, "PQconnectdb: %s", PQerrorMessage(conn));
+		PQfinish(conn);
+		_exit(-1);
+	}
 
 	pthread_mutex_init(&client_creation_lock, NULL);
 
@@ -108,6 +128,7 @@ void *handle_clients(void *arg)
 
 	if (listen(serve_client_socket, 8) == -1) {
 		perror("listen");
+		close(serve_client_socket);
 		_exit(errno);
 	}
 	printf("server: listening for client connections\n");
@@ -137,8 +158,10 @@ void *handle_client(void *info)
 	struct in_addr remote_addr;
 	switch (recv(client_socket, &remote_addr.s_addr, sizeof(remote_addr.s_addr), MSG_WAITALL)) {
 	case -1:
-		perror("recv");
+		//if (errno != EBADF)
+			perror("recv");
 	case 0:
+		printf("server: client disconnected\n");
 		close(client_socket);
 		pthread_exit(NULL);
 		break;
@@ -153,6 +176,8 @@ void *handle_client(void *info)
 		if (remote_info == NULL) {
 			perror("malloc");
 			close(client_socket);
+			remote_to_client_fd[remote_addr.s_addr].erase(client_socket);
+			pthread_mutex_unlock(&client_creation_lock);
 			pthread_exit(NULL);
 		}
 
@@ -162,10 +187,22 @@ void *handle_client(void *info)
 		remote_info->lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
 		if (remote_info->lock == NULL) {
 			perror("malloc");
+			free(remote_info);
 			close(client_socket);
+			remote_to_client_fd[remote_addr.s_addr].erase(client_socket);
+			pthread_mutex_unlock(&client_creation_lock);
 			pthread_exit(NULL);
 		}
-		pthread_mutex_init(remote_info->lock, NULL);
+
+		if (pthread_mutex_init(remote_info->lock, NULL) != 0) {
+			perror("pthread_mutex_init");
+			free(remote_info->lock);
+			free(remote_info);
+			close(client_socket);
+			remote_to_client_fd[remote_addr.s_addr].erase(client_socket);
+			pthread_mutex_unlock(&client_creation_lock);
+			pthread_exit(NULL);
+		}
 
 		remote_to_remote_info[remote_addr.s_addr] = remote_info;
 	}
@@ -176,15 +213,14 @@ void *handle_client(void *info)
 	while (1) {
 		uint32_t network_message_size;
 		switch (recv(client_socket, &network_message_size, sizeof(network_message_size), MSG_WAITALL)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: client disconnected\n");
-			close(client_socket);
-			remote_to_client_fd[remote_addr.s_addr].erase(client_socket);
+			handle_client_disconnect(client_socket, remote_addr.s_addr);
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
 
 		pthread_mutex_lock(client_message_lock);
@@ -193,56 +229,140 @@ void *handle_client(void *info)
 		uint32_t message_size = ntohl(network_message_size);
 		printf("server: recv message length: %d\n", message_size);
 
-		char *message = (char *) malloc(message_size + 1);
+		char *message = (char *) malloc(sizeof(uint32_t) + message_size + 1);
+		if (message == NULL) {
+			perror("malloc");
+			pthread_mutex_unlock(client_message_lock);
+			handle_client_disconnect(client_socket, remote_addr.s_addr);
+			pthread_exit(NULL);
+		}
+		*(uint32_t *) message = network_message_size;
 		message[message_size] = '\0';
 
-		switch (recv(client_socket, message, message_size, MSG_WAITALL)) {
+		switch (recv(client_socket, &message[sizeof(uint32_t)], message_size, MSG_WAITALL)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: client disconnected\n");
-			close(client_socket);
-			remote_to_client_fd[remote_addr.s_addr].erase(client_socket);
+			pthread_mutex_unlock(client_message_lock);
+			handle_client_disconnect(client_socket, remote_addr.s_addr);
 			free(message);
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
-		printf("server: recv from client: %s", message);
+		printf("server: recv from client: %s", &message[sizeof(uint32_t)]);
 
-		bool remote_is_connected = remote_to_remote_info[remote_addr.s_addr]->socket_fd != -1;
+		char safe_ip_str[INET_ADDRSTRLEN] = {0};
+		strcpy(safe_ip_str, inet_ntoa(remote_addr));
+		for (int i = 0; i < INET_ADDRSTRLEN; ++i) {
+			if (safe_ip_str[i] == '.')
+				safe_ip_str[i] = '_';
+		}
+
+		int remote_socket = remote_to_remote_info[remote_addr.s_addr]->socket_fd;
+		bool remote_is_connected = remote_socket != -1;
 		if (!remote_is_connected) {
 			struct attempt_connect_info attempt_info;
-			pthread_mutex_init(&attempt_info.lock, NULL);
-			pthread_cond_init(&attempt_info.cond, NULL);
+			if (pthread_mutex_init(&attempt_info.lock, NULL)) {
+				perror("pthread_mutex_init");
+				pthread_mutex_unlock(client_message_lock);
+				handle_client_disconnect(client_socket, remote_addr.s_addr);
+				free(message);
+				pthread_exit(NULL);
+			}
+			if (pthread_cond_init(&attempt_info.cond, NULL)) {
+				perror("pthread_cond_init");
+				pthread_mutex_destroy(&attempt_info.lock);
+				pthread_mutex_unlock(client_message_lock);
+				handle_client_disconnect(client_socket, remote_addr.s_addr);
+				free(message);
+				pthread_exit(NULL);
+			}
 			attempt_info.remote_is_connected = false;
 			attempt_info.remote_addr = remote_addr.s_addr;
 
 			pthread_t remote_connect_tid;
-			pthread_create(&remote_connect_tid, NULL, attempt_remote_connect, &attempt_info);
+			if (pthread_create(&remote_connect_tid, NULL, attempt_remote_connect, &attempt_info) != 0) {
+				perror("pthread_create");
+				pthread_mutex_destroy(&attempt_info.lock);
+				pthread_cond_destroy(&attempt_info.cond);
+				pthread_mutex_unlock(client_message_lock);
+				handle_client_disconnect(client_socket, remote_addr.s_addr);
+				free(message);
+				pthread_exit(NULL);
+			}
 
 			pthread_mutex_lock(&attempt_info.lock);
 			pthread_cond_wait(&attempt_info.cond, &attempt_info.lock);
 			pthread_mutex_unlock(&attempt_info.lock);
 			pthread_mutex_destroy(&attempt_info.lock);
+			pthread_cond_destroy(&attempt_info.cond);
 
 			if (!attempt_info.remote_is_connected) {
-				// if connection fail, store messages for later and create a pthread that accepts connections from that IP
-				
-				printf("server: I will store the message: %s\n", message);
+				printf("server: remote is not connected\n");
+				store_message(message, safe_ip_str, false);
 			}
+
+			remote_is_connected = attempt_info.remote_is_connected;
+			remote_socket = remote_to_remote_info[remote_addr.s_addr]->socket_fd;
 		}
 
 		if (remote_is_connected) {
-			int remote_socket = remote_to_remote_info[remote_addr.s_addr]->socket_fd;
-			if (send(remote_socket, &network_message_size, sizeof(network_message_size), 0) != sizeof(network_message_size)) {
-				perror("send");
+			// TODO: handle error cases and memory leaks
+			const char *get_messages_template = "SELECT id, message FROM \"%s\" WHERE sent_at IS NULL ORDER BY created_at ASC;";
+			int query_length = snprintf(NULL, 0, get_messages_template, safe_ip_str) + 1;
+			char *get_messages_query = (char *) calloc(query_length, sizeof(char));
+			snprintf(get_messages_query, query_length, get_messages_template, safe_ip_str);
+			PGresult *res = PQexec(conn, get_messages_query);
+			free(get_messages_query);
+			if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+				fprintf(stderr, "PQexec(get_messages_query): %s\n", PQerrorMessage(conn));
+				PQclear(res);
 			}
 
-			if (send(remote_socket, message, message_size, 0) != message_size) {
-				perror("send");
+			int nrows = PQntuples(res);
+			uint32_t *message_ids = (uint32_t *) calloc(nrows, sizeof(uint32_t));
+			if (message_ids == NULL) {
+				perror("malloc");
+				PQclear(res);
 			}
-			printf("server: sent to remote recipient\n");
+			char **messages = (char **) calloc(nrows, sizeof(char *));
+			if (messages == NULL) {
+				perror("malloc");
+				PQclear(res);
+			}
+
+			for (int i = 0; i < nrows; i++) {
+				message_ids[i] = atoi(PQgetvalue(res, i, 0));
+				const char *msg = PQgetvalue(res, i, 1);
+				uint32_t message_size = strlen(msg);
+				messages[i] = (char *) malloc(sizeof(uint32_t) + message_size + 1);
+				*(uint32_t *)messages[i] = htonl(message_size);
+				memcpy(&messages[i][sizeof(uint32_t)], msg, message_size);
+				messages[i][sizeof(uint32_t) + message_size] = '\0';
+			}
+			PQclear(res);
+			
+			for (int i = 0; i < nrows; ++i) {
+				printf("server: sending to %s message: %s\n", safe_ip_str, &messages[i][sizeof(uint32_t)]);
+				if (send(remote_socket, messages[i], sizeof(uint32_t) + message_size, 0) != sizeof(uint32_t) + message_size) {
+					perror("send");
+					break;
+				} else {
+					update_sent_message(message_ids[i], safe_ip_str);
+				}
+			}
+			for (int i = 0; i < nrows; ++i)
+				free(messages[i]);
+
+			free(message_ids);
+			free(messages);
+
+			if (send(remote_socket, message, sizeof(uint32_t) + message_size, 0) != sizeof(uint32_t) + message_size)
+				store_message(message, safe_ip_str, false);
+			else
+				store_message(message, safe_ip_str, true);
 		}
 
 		pthread_mutex_unlock(client_message_lock);
@@ -293,7 +413,7 @@ void *attempt_remote_connect(void *info)
 	}
 
 	uint8_t confirmation = 0;
-	if (recv(remote_socket, &confirmation, sizeof(confirmation), 0) != sizeof(confirmation) || confirmation != 42) {
+	if (recv(remote_socket, &confirmation, sizeof(confirmation), 0) != sizeof(confirmation) || confirmation != CONFIRMATION) {
 		pthread_cond_signal(&attempt_info->cond);
 		close(remote_socket);
 		pthread_exit(NULL);
@@ -312,6 +432,9 @@ void *attempt_remote_connect(void *info)
 	while (1) {
 		uint32_t network_message_size;
 		switch (recv(remote_socket, &network_message_size, sizeof(network_message_size), 0)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: remote disconnected\n");
 			close(remote_socket);
@@ -319,9 +442,6 @@ void *attempt_remote_connect(void *info)
 			remote_info->thread_id = (pthread_t) -1;
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
 
 		pthread_mutex_lock(remote_info->lock);
@@ -330,28 +450,36 @@ void *attempt_remote_connect(void *info)
 		uint32_t message_size = ntohl(network_message_size);
 		printf("server: recv message length: %d\n", message_size);
 
-		char *message = (char *) malloc(message_size + 1);
+		char *message = (char *) malloc(sizeof(uint32_t) + message_size + 1);
+		if (message == NULL) {
+			perror("malloc");
+			close(remote_socket);
+			remote_info->socket_fd = -1;
+			remote_info->thread_id = (pthread_t) -1;
+			pthread_mutex_unlock(remote_info->lock);
+			pthread_exit(NULL);
+		}
+		*(uint32_t *) message = network_message_size;
 		message[message_size] = '\0';
 
-		switch (recv(remote_info->socket_fd, message, message_size, 0)) {
+		switch (recv(remote_socket, &message[sizeof(uint32_t)], message_size, MSG_WAITALL)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: remote disconnected\n");
-			close(remote_info->socket_fd);
+			close(remote_socket);
 			remote_info->socket_fd = -1;
 			remote_info->thread_id = (pthread_t) -1;
 			free(message);
 			pthread_mutex_unlock(remote_info->lock);
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
-		printf("server: recv from remote: %s", message);
+		printf("server: recv from remote: %s", &message[sizeof(uint32_t)]);
 
 		for (uint32_t client_fd : remote_to_client_fd[remote_info->addr.sin_addr.s_addr]) {
-			send(client_fd, &network_message_size, sizeof(network_message_size), 0);
-			send(client_fd, message, message_size, 0);
+			send(client_fd, message, sizeof(uint32_t) + message_size, 0);
 		}
 		printf("server: sent to connected clients\n");
 
@@ -362,6 +490,102 @@ void *attempt_remote_connect(void *info)
 	}
 
 	return NULL;
+}
+
+
+int store_message(char *message, char safe_ip_str[INET_ADDRSTRLEN], bool is_sent)
+{
+	int message_id = -1;
+
+	const char *create_table_template = \
+	"CREATE TABLE IF NOT EXISTS \"%s\" ("
+		"id SERIAL PRIMARY KEY, "
+		"message TEXT NOT NULL, "
+		"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+		"sent_at TIMESTAMP DEFAULT NULL"
+	");";
+	int query_length = snprintf(NULL, 0, create_table_template, safe_ip_str) + 1;
+	char *create_table_query = (char *) calloc(query_length, sizeof(char));
+	snprintf(create_table_query, query_length, create_table_template, safe_ip_str);
+
+	PGresult *res = PQexec(conn, create_table_query);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+		fprintf(stderr, "PQexec(create_table_query): %s", PQerrorMessage(conn));
+		free(create_table_query);
+		PQclear(res);
+		return message_id;
+	}
+
+	free(create_table_query);
+	PQclear(res);
+
+	printf("server: I will store the %s message: %s\n", is_sent ? "sent" : "unsent", &message[sizeof(uint32_t)]);
+
+	const char *insert_message_template = "INSERT INTO \"%s\" (message, sent_at) VALUES ($1, %s) RETURNING id;";
+	query_length = snprintf(NULL, 0, insert_message_template, safe_ip_str, is_sent ? "NOW()" : "NULL") + 1;
+	char *insert_message_query = (char *) calloc(query_length, sizeof(char));
+	snprintf(insert_message_query, query_length, insert_message_template, safe_ip_str, is_sent ? "NOW()" : "NULL");
+
+	const char *message_param[1] = { &message[sizeof(uint32_t)] };
+	res = PQexecParams(
+		conn,
+		insert_message_query,
+		1,
+		NULL,
+		message_param,
+		NULL,
+		NULL,
+		0
+	);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		fprintf(stderr, "PQexecParams(insert_message_query): %s", PQerrorMessage(conn));
+	else
+		message_id = atoi(PQgetvalue(res, 0, 0));
+
+	free(insert_message_query);
+	PQclear(res);
+
+	return message_id;
+}
+
+
+void update_sent_message(int message_id, char safe_ip_str[INET_ADDRSTRLEN])
+{
+	printf("server: sent to remote recipient\n");
+
+	const char *update_sent_template = "UPDATE \"%s\" SET sent_at = NOW() WHERE id = %d;";
+	int query_length = snprintf(NULL, 0, update_sent_template, safe_ip_str, message_id) + 1;
+	char *update_sent_query = (char *) calloc(query_length, sizeof(char));
+	snprintf(update_sent_query, query_length, update_sent_template, safe_ip_str, message_id);
+	PGresult *res = PQexec(conn, update_sent_query);
+	free(update_sent_query);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+		fprintf(stderr, "PQexec(update_sent_query): %s\n", PQerrorMessage(conn));
+	}
+
+	PQclear(res);
+}
+
+
+void handle_client_disconnect(uint64_t client_socket, uint32_t s_addr)
+{
+	close(client_socket);
+
+	remote_to_client_fd[s_addr].erase(client_socket);
+	printf("server: there are now %zu clients connected\n", remote_to_client_fd[s_addr].size());
+	if (remote_to_client_fd[s_addr].size() == 0) {
+		if (remote_to_remote_info[s_addr]->lock != NULL) {
+			pthread_mutex_destroy(remote_to_remote_info[s_addr]->lock);
+			free(remote_to_remote_info[s_addr]->lock);
+		}
+		printf("shutting down thread and socket %d", remote_to_remote_info[s_addr]->socket_fd);
+		shutdown(remote_to_remote_info[s_addr]->socket_fd, SHUT_RDWR);
+		if (pthread_join(remote_to_remote_info[s_addr]->thread_id, NULL) != 0)
+			perror("pthread_join");
+		free(remote_to_remote_info[s_addr]);
+		remote_to_remote_info.erase(s_addr);
+		remote_to_client_fd.erase(s_addr);
+	}
 }
 
 
@@ -409,11 +633,10 @@ void *handle_remotes(void *arg)
 			continue;
 		}
 
-		// TODO: print out IPs and error check
 		if (remote_to_remote_info.find(remote_addr.sin_addr.s_addr) != remote_to_remote_info.end()) {
 			printf("server: accepted remote connection from %s\n", inet_ntoa(remote_addr.sin_addr));
 
-			uint8_t confirmation = 42;
+			uint8_t confirmation = CONFIRMATION;
 			if (send(remote_socket, &confirmation, sizeof(confirmation), 0) != sizeof(confirmation)) {
 				close(remote_socket);
 				continue;
@@ -431,7 +654,7 @@ void *handle_remotes(void *arg)
 			}
 		} else {
 			// reject connection
-			printf("server: A remote connection not matching a client was attemptedi from %s\n", inet_ntoa(remote_addr.sin_addr));
+			printf("server: A remote connection not matching a client was attempted from %s\n", inet_ntoa(remote_addr.sin_addr));
 			close(remote_socket);
 		}
 	}
@@ -449,6 +672,9 @@ void *handle_remote(void *info)
 	while (1) {
 		uint32_t network_message_size;
 		switch (recv(remote_socket, &network_message_size, sizeof(network_message_size), 0)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: remote disconnected\n");
 			close(remote_socket);
@@ -456,9 +682,6 @@ void *handle_remote(void *info)
 			remote_info->thread_id = (pthread_t) -1;
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
 
 		pthread_mutex_lock(remote_info->lock);
@@ -467,10 +690,17 @@ void *handle_remote(void *info)
 		uint32_t message_size = ntohl(network_message_size);
 		printf("server: recv message length: %d\n", message_size);
 
-		char *message = (char *) malloc(message_size + 1);
+		char *message = (char *) malloc(sizeof(uint32_t) + message_size + 1);
+		if (message == NULL) {
+			// TODO
+		}
+		*(uint32_t *) message = network_message_size;
 		message[message_size] = '\0';
 
-		switch (recv(remote_info->socket_fd, message, message_size, 0)) {
+		switch (recv(remote_info->socket_fd, &message[sizeof(uint32_t)], message_size, 0)) {
+		case -1:
+			//if (errno != EBADF)
+				perror("recv");
 		case 0:
 			printf("server: remote disconnected\n");
 			close(remote_info->socket_fd);
@@ -480,15 +710,11 @@ void *handle_remote(void *info)
 			pthread_mutex_unlock(remote_info->lock);
 			pthread_exit(NULL);
 			break;
-		case -1:
-			perror("recv");
-			continue;
 		}
-		printf("server: recv from remote: %s", message);
+		printf("server: recv from remote: %s", &message[sizeof(uint32_t)]);
 
 		for (uint32_t client_fd : remote_to_client_fd[remote_info->addr.sin_addr.s_addr]) {
-			send(client_fd, &network_message_size, sizeof(network_message_size), 0);
-			send(client_fd, message, message_size, 0);
+			send(client_fd, message, sizeof(uint32_t) + message_size, 0);
 		}
 		printf("server: sent to connected clients\n");
 
